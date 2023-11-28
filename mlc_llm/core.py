@@ -1,20 +1,15 @@
 # pylint: disable=missing-docstring, redefined-outer-name, not-callable
 import argparse
+import functools
 import json
 import os
 import pickle
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, Optional
 
+import mlc_llm
 import tvm
 import tvm.relax.backend.contrib.cublas as _
-from tvm import dlight as dl
-from tvm import relax
-from tvm.contrib.nvcc import parse_compute_version
-from tvm.relax.backend import get_patterns_with_prefix
-from tvm.relax.backend.contrib.cutlass import annotate_workspace
-
-import mlc_llm
 from mlc_llm import utils
 from mlc_llm.relax_model import (
     chatglm,
@@ -22,11 +17,27 @@ from mlc_llm.relax_model import (
     gpt_neox,
     gptj,
     llama,
+    llama_batched_vllm,
     minigpt,
+    mistral,
     param_manager,
     rwkv,
+    stablelm_3b,
+)
+from mlc_llm.relax_model.commons import (
+    create_shard_info_func,
+    create_shard_transformation_func,
+)
+from mlc_llm.relax_model.param_manager import (
+    chain_parameter_transforms,
+    transform_params_for_each_rank,
 )
 from mlc_llm.transform import fuse_split_rotary_embedding, rewrite_attention
+from tvm import dlight as dl
+from tvm import relax
+from tvm.contrib.nvcc import parse_compute_version
+from tvm.relax.backend import get_patterns_with_prefix
+from tvm.relax.backend.contrib.cutlass import annotate_workspace
 
 
 @dataclass
@@ -44,39 +55,105 @@ class BuildArgs:
         The name of the model to build. If it is ``auto``, we will automatically
         set the model name according to ``--model-path``, ``hf-path``, or the model
         folders under ``--artifact-path/models``.
+
     hf_path: str
         Hugging Face path from which to download params, tokenizer, and config.
+
     quantization: str
         The quantization mode we use to compile.
+
     max_seq_len: int
         The maximum allowed sequence length for the model.
+
     target: str
         The target platform to compile the model for.
+
     db_path: str
         Path to log database for all models. Default: ``./log_db/``.
+
     reuse_lib: str
         Whether to reuse a previously generated lib.
+
     artifact_path: str
         Where to store the output.
+
     use_cache: int
         Whether to use previously pickled IRModule and skip trace.
-    convert_weight_only: bool
+
+    convert_weights_only: bool
         Whether to only convert model weights and not build the model. If both
         ``convert_weight_only`` and ``build_model_only`` are set, the behavior is undefined.
+
     build_model_only: bool
         Whether to only build model and do not convert model weights.
+
     debug_dump: bool
         Whether to dump debugging files during compilation.
+
     debug_load_script: bool
         Whether to load the script for debugging.
+
     llvm_mingw: str
         ``/path/to/llvm-mingw-root``, use llvm-mingw to cross compile to windows.
+
     system_lib: bool
         A parameter to ``relax.build``.
+
     sep_embed: bool
         Build with separated embedding layer, only applicable to LlaMa. This
         feature is in testing stage, and will be formally replaced after massive
         overhaul of embedding feature for all models and use cases.
+
+    sliding_window: int
+        The sliding window size in sliding window attention (SWA). This optional field
+        overrides the `sliding_window` in config.json for those models that use SWA.
+        Currently only useful when compiling Mistral.
+
+    prefill_chunk_size: int
+        The chunk size during prefilling. By default, the chunk size is the same as
+        max sequence length. Currently only useful when compiling Mistral.
+
+    cc_path: str
+        ``/path/to/cross_compiler_path``; currently only used for cross-compile
+        for nvidia/jetson device.
+
+    use_safetensors: bool
+        Specifies whether to use ``.safetensors`` instead of the default ``.bin``
+        when loading in model weights.
+
+    enable_batching: bool
+        Build the model for batched inference.
+        This is a temporary flag used to control the model execution flow in single-
+        sequence and batching settings for now. We will eventually merge two flows
+        in the future and remove this flag then.
+
+    no_cutlass_attn: bool
+        Disable offloading attention operations to CUTLASS.
+
+    no_cutlass_norm: bool
+        Disable offloading layer and RMS norm operations to CUTLASS.
+
+    no_cublas: bool
+        Disable the step that offloads matmul to cuBLAS. Without this flag,
+        matmul will be offloaded to cuBLAS if quantization mode is ``q0f16`` or
+        ``q0f32``, target is CUDA and TVM has been built with cuBLAS enabled.
+
+    use_cuda_graph: bool
+        Specifies whether to enable CUDA Graph for the decoder. MLP and QKV
+        projection between two attention layers are put into a graph.
+
+    num_shards: int
+        Number of shards to split the model into in tensor parallelism multi-gpu
+        inference. Only useful when ``build_model_only`` is set.
+
+    use_flash_attn_mqa: bool
+        Offload multi-query attention workload to Flash Attention.
+
+    pdb: bool
+        If set, drop into a pdb debugger on error.
+
+    use_vllm_attention: bool
+        Use vLLM paged KV cache and attention kernel, only relevant when enable_batching=True.
     """
     model: str = field(
         default="auto",
@@ -103,6 +180,10 @@ class BuildArgs:
         default=-1,
         metadata={"help": "The maximum allowed sequence length for the model."},
     )
+    max_vocab_size: int = field(
+        default=40000,
+        metadata={"help": "The maximum allowed vocabulary size for the model."},
+    )
     target: str = field(
         default="auto",
         metadata={"help": "The target platform to compile the model for."},
@@ -115,11 +196,12 @@ class BuildArgs:
         default=1,
         metadata={"help": "Whether to use previously pickled IRModule and skip trace."},
     )
-    convert_weight_only: bool = field(
+    convert_weights_only: bool = field(
         default=False,
         metadata={
-            "help": "Whether to only convert model weights and not build the model.",
+            "dest": "convert_weights_only",
             "action": "store_true",
+            "help": "Whether to only convert model weights and not build the model.",
         },
     )
     build_model_only: bool = field(
@@ -150,7 +232,10 @@ class BuildArgs:
     cc_path: str = field(
         default="",
         metadata={
-            "help": "/path/to/cross_compiler_path, Currently only used for cross-compile for nvidia/jetson device."
+            "help": (
+                "/path/to/cross_compiler_path, Currently only used for "
+                "cross-compile for nvidia/jetson device."
+            )
         },
     )
     system_lib: bool = field(
@@ -178,23 +263,37 @@ class BuildArgs:
             "action": "store_true",
         },
     )
-    no_cutlass_attn: bool = field(
+    enable_batching: bool = field(
         default=False,
         metadata={
             "help": (
-                "Offload attention operations to CUTLASS when the target is CUDA"
-                "and TVM has been built with CUTLASS enabled."
+                "Build the model for batched inference."
+                "This is a temporary flag used to control the model execution flow in single-"
+                "sequence and batching settings for now. We will eventually merge two flows"
+                "in the future and remove this flag then."
             ),
+            "action": "store_true",
+        },
+    )
+    max_batch_size: int = field(
+        default=80,
+        metadata={
+            "help": (
+                "The maximum batch size for build. It has effect only when batching is enabled."
+            ),
+        },
+    )
+    no_cutlass_attn: bool = field(
+        default=False,
+        metadata={
+            "help": ("Disable offloading attention operations to CUTLASS."),
             "action": "store_true",
         },
     )
     no_cutlass_norm: bool = field(
         default=False,
         metadata={
-            "help": (
-                "Offload layer and RMS norm operations to CUTLASS when the target is CUDA"
-                "and TVM has been built with CUTLASS enabled."
-            ),
+            "help": ("Disable offloading layer and RMS norm operations to CUTLASS."),
             "action": "store_true",
         },
     )
@@ -204,7 +303,7 @@ class BuildArgs:
             "help": (
                 "Disable the step that offloads matmul to cuBLAS. Without this flag, "
                 "matmul will be offloaded to cuBLAS if quantization mode is q0f16 or q0f32, "
-                "target is CUDA and TVM has been built with cuBLAS enbaled."
+                "target is CUDA and TVM has been built with cuBLAS enabled."
             ),
             "action": "store_true",
         },
@@ -224,10 +323,66 @@ class BuildArgs:
         metadata={
             "help": (
                 "Number of shards to split the model into in tensor parallelism multi-gpu "
-                "inference"
+                "inference. Only useful when --build-model-only is set."
             ),
         },
     )
+    use_presharded_weights: bool = field(
+        default=False,
+        metadata={
+            "action": "store_true",
+            "help": "Produce separate weight sets for each shard.",
+        },
+    )
+    use_flash_attn_mqa: bool = field(
+        default=False,
+        metadata={
+            "help": ("Offload multi-query attention workload to Flash Attention."),
+            "action": "store_true",
+        },
+    )
+    sliding_window: int = field(
+        default=-1,
+        metadata={
+            "help": (
+                "The sliding window size in sliding window attention (SWA). "
+                "This optional field overrides the `sliding_window` in config.json for "
+                "those models that use SWA. Currently only useful when compiling Mistral."
+            ),
+        },
+    )
+    prefill_chunk_size: int = field(
+        default=-1,
+        metadata={
+            "help": (
+                "The chunk size during prefilling. By default, the chunk size is "
+                "the same as the sliding window size or the max sequence length. "
+                "Currently only useful when compiling Mistral."
+            ),
+        },
+    )
+    pdb: bool = field(
+        default=False,
+        metadata={
+            "help": ("If set, drop into a pdb debugger on error"),
+            "action": "store_true",
+        },
+    )
+    use_vllm_attention: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use vLLM paged KV cache and attention kernel, only relevant when "
+                "enable_batching=True."
+            ),
+            "action": "store_true",
+        },
+    )
+
+    @property
+    def convert_weight_only(self):
+        """A backwards-compatibility helper"""
+        return self.convert_weights_only
 
 
 def convert_build_args_to_argparser() -> argparse.ArgumentParser:
@@ -243,6 +398,20 @@ def convert_build_args_to_argparser() -> argparse.ArgumentParser:
             args.add_argument(field_name, default=field.default, **kwargs)
         else:
             args.add_argument(field_name, type=field.type, default=field.default, **kwargs)
+
+    # Most models contain more than a single parameter (citation
+    # needed), so "weights" should be plural.  The initial use of
+    # "--convert-weight-only" caused enough typos that it is worth
+    # fixing.  The old argument spelling is retained for backwards
+    # compatibility.
+    args.add_argument(
+        "--convert-weight-only",
+        default=False,
+        dest="convert_weights_only",
+        action="store_true",
+        help="Equivalent to --convert-weights-only, retained for backwards compatibility.",
+    )
+
     return args
 
 
@@ -264,9 +433,21 @@ def _parse_args(parsed) -> argparse.Namespace:
     utils.parse_target(parsed)
     utils.argparse_postproc_common(parsed)
 
-    parsed.artifact_path = os.path.join(
-        parsed.artifact_path, f"{parsed.model}-{parsed.quantization.name}"
-    )
+    if parsed.use_vllm_attention:
+        assert parsed.enable_batching, "--enable_batching is required for using vLLM attention."
+        assert parsed.target_kind == "cuda", "vLLM attention is only supported for CUDA."
+        assert tvm.get_global_func(
+            "tvm.contrib.vllm.single_query_cached_kv_attention", True
+        ), "TVM needs to be built with -DUSE_VLLM=ON."
+
+    model_name = [
+        parsed.model,
+        parsed.quantization.name,
+    ]
+    if parsed.use_presharded_weights:
+        model_name.append(f"presharded-{parsed.num_shards}gpu")
+
+    parsed.artifact_path = os.path.join(parsed.artifact_path, "-".join(model_name))
 
     return parsed
 
@@ -323,10 +504,10 @@ def _setup_model_path(args: argparse.Namespace):  # pylint: disable=too-many-bra
 def validate_config(model_path: str):
     if os.path.exists(os.path.join(model_path, "mlc-chat-config.json")):
         raise KeyError(
-            "The model located in the directory {} has already been compiled by MLC-LLM. There is"
-            " no need to compile it again. If you wish to compile a new model, please provide a"
-            " directory (or hf-path) that contains the pre-compiled model in raw HuggingFace"
-            " format instead.".format(model_path)
+            f"The model located in the directory {model_path} has already been compiled "
+            "by MLC-LLM. There is no need to compile it again. If you wish to compile "
+            "a new model, please provide a directory (or hf-path) that contains the "
+            "pre-compiled model in raw HuggingFace format instead."
         )
     if model_path.split("/")[-1].startswith("minigpt"):
         # minigpt does not contain a config.json file so we skip the check
@@ -358,24 +539,43 @@ def mod_transform_before_build(
         model_names = [
             "prefill",
             "decode",
-            "create_kv_cache",
-            "softmax_with_temperature",
-            "get_metadata",
         ]
+
+        if not args.use_vllm_attention:
+            model_names += [
+                "create_kv_cache",
+                "softmax_with_temperature",
+                "get_metadata",
+            ]
+        else:
+            # This is equivalent to prefill but without KV cache. It is used for
+            # determining the number of paged cache blocks that can be allocated.
+            model_names.append("evaluate")
+
         if args.sep_embed:
             model_names = ["embed", "prefill_with_embed"] + model_names[1:]
+            if args.enable_batching:
+                model_names[2] = "decode_with_embed"
         if args.model.lower().startswith("rwkv-"):
             model_names += ["reset_kv_cache"]
 
-    mod = param_manager.transform_dequantize(mod)
+    mod = param_manager.transform_dequantize()(mod)
+    mod = relax.transform.BundleModelParams()(mod)
 
-    use_ft_quant = args.quantization.name in ["q4f16_ft", "q8f16_ft"]
+    use_ft_quant = args.quantization.name in [
+        "q4f16_ft",
+        "q8f16_ft",
+        "q4f16_ft_group",
+        "q8f16_ft_group",
+    ]
     mod = mlc_llm.transform.FuseDecodeTranspose(skip_gemm=not use_ft_quant)(mod)
 
     if (
-        hasattr(config, "num_attention_heads")
+        not args.enable_batching
+        and hasattr(config, "num_attention_heads")
         and hasattr(config, "hidden_size")
         and hasattr(config, "position_embedding_base")
+        and getattr(config, "dtype", "float16") == "float16"
     ):
         max_seq_len = None
         if args.max_seq_len > 0:
@@ -384,14 +584,14 @@ def mod_transform_before_build(
             max_seq_len = config.max_sequence_length
 
         if max_seq_len:
-            num_key_value_heads = (
-                config.num_key_value_heads is None
-                and config.num_attention_heads
-                or config.num_key_value_heads
-            )
+            num_key_value_heads = config.get_num_key_value_heads()
+            # pylint: disable=no-value-for-parameter
             mod = fuse_split_rotary_embedding(
-                mod, config.num_attention_heads // args.num_shards, num_key_value_heads//args.num_shards, config.hidden_size // args.num_shards, config.position_embedding_base
-            )
+                config.num_attention_heads // args.num_shards,
+                num_key_value_heads // args.num_shards,
+                config.hidden_size // args.num_shards,
+                config.position_embedding_base,
+            )(mod)
 
     if args.target_kind == "cuda":
         patterns = []
@@ -399,8 +599,10 @@ def mod_transform_before_build(
         has_cutlass = tvm.get_global_func("relax.ext.cutlass", True)
 
         if has_cutlass and not args.no_cutlass_attn:
-            mod["prefill"] = rewrite_attention(mod["prefill"])
-            mod["decode"] = rewrite_attention(mod["decode"])
+            # pylint: disable=no-value-for-parameter
+            if args.use_flash_attn_mqa:
+                mod = rewrite_attention(use_flash_mqa=True)(mod)
+            mod = rewrite_attention(use_flash_mqa=False)(mod)
             patterns += get_patterns_with_prefix("cutlass.attention")
 
         if has_cutlass and not args.no_cutlass_norm:
@@ -425,6 +627,11 @@ def mod_transform_before_build(
             else:
                 sm = 10 * major + minor
 
+            options = {"cutlass": {"sm": sm, "find_first_valid": False}}
+
+            if hasattr(config, "rms_norm_eps"):
+                options["cutlass"]["rms_eps"] = config.rms_norm_eps
+
             mod = tvm.transform.Sequential(
                 [
                     relax.transform.FuseOpsByPattern(
@@ -432,10 +639,7 @@ def mod_transform_before_build(
                     ),
                     annotate_workspace,
                     relax.transform.AllocateWorkspace(),
-                    relax.transform.RunCodegen(
-                        {"cutlass": {"sm": sm, "find_first_valid": False}},
-                        entry_functions=model_names,
-                    ),
+                    relax.transform.RunCodegen(options, entry_functions=model_names),
                 ]
             )(mod)
 
@@ -462,6 +666,7 @@ def dump_mlc_chat_config(
     mean_gen_len: int = 128,
     max_gen_len: int = 512,
     shift_fill_factor: float = 0.3,
+    rwkv_world=False,
 ):
     args.params_path = os.path.join(args.artifact_path, "params")
     config: Dict[str, Any] = {}
@@ -480,13 +685,22 @@ def dump_mlc_chat_config(
     config["top_p"] = top_p
     config["mean_gen_len"] = mean_gen_len
     config["max_gen_len"] = max_gen_len
-    config["max_window_size"] = max_window_size
     config["num_shards"] = args.num_shards
+    config["use_presharded_weights"] = args.use_presharded_weights
     config["shift_fill_factor"] = shift_fill_factor
-    config["tokenizer_files"] = utils.get_tokenizer_files(args.params_path)
+    if rwkv_world:
+        config["tokenizer_files"] = ["tokenizer_model"]
+    else:
+        config["tokenizer_files"] = utils.get_tokenizer_files(args.params_path)
     config["model_category"] = args.model_category
     config["model_name"] = args.model
     config["vocab_size"] = vocab_size
+    config["prefill_chunk_size"] = args.prefill_chunk_size
+    if args.sliding_window != -1:
+        # Do not add max window size if use sliding window
+        config["sliding_window"] = args.sliding_window
+    else:
+        config["max_window_size"] = max_window_size
 
     args.chat_config_path = os.path.join(args.params_path, "mlc-chat-config.json")
     with open(args.chat_config_path, "w", encoding="utf-8") as outfile:
@@ -523,6 +737,7 @@ def build(mod_deploy: tvm.IRModule, args: argparse.Namespace) -> None:
                     mod_deploy
                 )
             )
+        if not args.enable_batching:
             mod_deploy = tvm.tir.transform.ForceNarrowIndexToInt32()(mod_deploy)
 
     if args.debug_load_script:
@@ -535,7 +750,9 @@ def build(mod_deploy: tvm.IRModule, args: argparse.Namespace) -> None:
     with tvm.transform.PassContext(config={"relax.backend.use_cuda_graph": use_cuda_graph}):
         # The num_input attribute is needed to capture transformed weights passed as input
         # into a cuda graph.
-        mod_deploy["decode"] = mod_deploy["decode"].with_attr({"num_input": 3})
+        # NOTE: CUDA graph for batching is not enabled and is left as a TODO item.
+        if not args.enable_batching:
+            mod_deploy["decode"] = mod_deploy["decode"].with_attr({"num_input": 3})
         ex = relax.build(mod_deploy, args.target, system_lib=args.system_lib)
 
     output_filename = f"{args.model}-{args.quantization.name}-{target_kind}.{args.lib_format}"
@@ -546,39 +763,21 @@ def build(mod_deploy: tvm.IRModule, args: argparse.Namespace) -> None:
     print(f"Finish exporting to {args.lib_path}")
 
 
-def dump_shard_info(args, param_manager):
-    if not args.build_model_only:
-        return
-    os.makedirs(os.path.join(args.artifact_path, "params"), exist_ok=True)
-    shard_info_path = os.path.join(args.artifact_path, "params", "shard_info.json")
-    shard_info_dict = {}
-    for _, param in param_manager.params.items():
-        shard_dim = param.shard_dim
-        if shard_dim is None:
-            continue
-        for i in param_manager.param2qrange[param]:
-            param_name = f"param_{i}"
-            shard_info_dict[param_name] = shard_dim
-    print(f"Finish exporting sharding information to {shard_info_path}")
-    with open(shard_info_path, "w", encoding="utf-8") as o_f:
-        json.dump(shard_info_dict, o_f)
-
-
 def build_model_from_args(args: argparse.Namespace):
     if args.quantization == "q4f16_0":
         print(
             "WARNING: q4f16_1 is preferred to q4f16_0, "
-            "and it is highly recommended to use q4f16_1 instaed"
+            "and it is highly recommended to use q4f16_1 instead"
         )
     if args.num_shards > 1:
-        if (args.build_model_only and args.convert_weight_only) or (
-            not args.build_model_only and not args.convert_weight_only
-        ):
+        if (not args.build_model_only) and (not args.convert_weights_only):
             raise ValueError(
-                "When num_shards > 1, precisely one of `build_model_only` and"
-                " `convert_weight_only` are expected to be set"
+                "`num_shards` should be used together with "
+                "`--build-model-only` and `--convert-weight-only`"
             )
-
+        use_ft_quant = args.quantization.name in ["q4f16_ft", "q8f16_ft"]
+        if use_ft_quant:
+            raise ValueError("Multi-GPU deployments are not available for ft quantization.")
     os.makedirs(args.artifact_path, exist_ok=True)
     if args.debug_dump:
         os.makedirs(os.path.join(args.artifact_path, "debug"), exist_ok=True)
@@ -587,36 +786,88 @@ def build_model_from_args(args: argparse.Namespace):
     use_cache = args.use_cache and os.path.isfile(cache_path)
     if args.sep_embed and args.model_category != "llama":
         raise ValueError(f"separate embedding not supported on {args.model}")
-    if args.model_category != "minigpt":
+
+    if args.model_category == "minigpt":
+        # Special case for minigpt, which neither provides nor requires a configuration.
+        config = {}
+    else:
         with open(os.path.join(args.model_path, "config.json"), encoding="utf-8") as i_f:
             config = json.load(i_f)
-    if not use_cache or args.convert_weight_only:
-        if args.model_category == "llama":
-            mod, param_manager, params, model_config = llama.get_model(args, config)
-        elif args.model_category == "mistral":
-            mod, param_manager, params, model_config = llama.get_model(args, config)
-        elif args.model_category == "gpt_neox":
-            mod, param_manager, params, model_config = gpt_neox.get_model(args, config)
-        elif args.model_category == "gpt_bigcode":
-            mod, param_manager, params, model_config = gpt_bigcode.get_model(args, config)
-        elif args.model_category == "minigpt":
-            mod, param_manager, params, model_config = minigpt.get_model(args)
-        elif args.model_category == "gptj":
-            mod, param_manager, params, model_config = gptj.get_model(args, config)
-        elif args.model_category == "rwkv" or args.model_category == "rwkv_world":
-            mod, param_manager, params, model_config = rwkv.get_model(args, config)
-        elif args.model_category == "chatglm":
-            mod, param_manager, params, model_config = chatglm.get_model(args, config)
-        else:
-            raise ValueError(f"Model {args.model} not supported")
+
+    if not use_cache or args.convert_weights_only:
+        model_generators = {
+            "llama": llama,
+            "mistral": mistral,
+            "stablelm_epoch": stablelm_3b,
+            "gpt_neox": gpt_neox,
+            "gpt_bigcode": gpt_bigcode,
+            "minigpt": minigpt,
+            "gptj": gptj,
+            "rwkv": rwkv,
+            "rwkv_world": rwkv,
+            "chatglm": chatglm,
+        }
+
+        if args.use_vllm_attention:
+            model_generators["llama"] = llama_batched_vllm
+            model_generators["mistral"] = llama_batched_vllm
+
+        assert args.model_category in model_generators, f"Model {args.model} not supported"
+
+        mod, param_manager, params, model_config = model_generators[args.model_category].get_model(
+            args, config
+        )
+
+        if args.model_category == "mistral":
+            args.sliding_window = model_config.sliding_window
 
         for qspec_updater_class in param_manager.qspec_updater_classes:
             qspec_updater = qspec_updater_class(param_manager)
             qspec_updater.visit_module(mod)
 
         if not args.build_model_only:
-            new_params = utils.convert_weights(param_manager, params, args)
-            utils.save_params(new_params, args.artifact_path)
+            parameter_transforms = []
+
+            # Run pre-quantization if provided.
+            args.model_path = param_manager.run_pre_quantize(args.model_path)
+            param_manager.init_torch_pname_to_bin_name(args.use_safetensors)
+            parameter_transforms.append(param_manager.create_parameter_transformation())
+
+            # Run pre-sharding if required
+            if args.num_shards > 1 and args.use_presharded_weights:
+                mod_shard = create_shard_transformation_func(param_manager, args, model_config)
+                mod_shard = transform_params_for_each_rank(mod_shard, num_shards=args.num_shards)
+                parameter_transforms.append(mod_shard)
+
+            # Chain all parameter transforms together.  This allows
+            # ReorderTransformFunc to be applied to the single
+            # resulting parameter transformation function.
+            mod_transform = functools.reduce(chain_parameter_transforms, parameter_transforms)
+
+            seq = tvm.ir.transform.Sequential(
+                [
+                    relax.transform.CanonicalizeBindings(),
+                    relax.transform.EliminateCommonSubexpr(),
+                    relax.transform.DeadCodeElimination(),
+                    # TODO(Lunderberg): Implement
+                    # relax.transform.Simplify() that applies
+                    # canonicalization, CSE, and DCE until
+                    # convergence.
+                    relax.transform.CanonicalizeBindings(),
+                    relax.transform.EliminateCommonSubexpr(),
+                    relax.transform.DeadCodeElimination(),
+                    param_manager.optimize_transform_param_order(),
+                ],
+                name="SimplifyModTransform",
+            )
+
+            mod_transform = seq(mod_transform)
+
+            params = utils.convert_weights(mod_transform, param_manager, params, args)
+            utils.save_params(
+                params, args.artifact_path, args.num_shards if args.use_presharded_weights else 1
+            )
+
             if args.model_category != "minigpt":
                 utils.copy_tokenizer(args)
             if args.model_category == "rwkv" or args.model_category == "rwkv_world":
@@ -625,22 +876,39 @@ def build_model_from_args(args: argparse.Namespace):
                     args,
                     vocab_size=config["vocab_size"],
                     max_window_size=model_config.max_sequence_length,
+                    max_gen_len=model_config.max_sequence_length,
                     top_p=0.6,
                     temperature=1.2,
                     repetition_penalty=0.996,
+                    rwkv_world=True,
+                )
+            elif args.model_category == "chatglm":
+                dump_mlc_chat_config(
+                    args,
+                    vocab_size=config["padded_vocab_size"],
+                    max_window_size=model_config.max_sequence_length,
+                    max_gen_len=model_config.max_sequence_length,
                 )
             else:
                 dump_mlc_chat_config(
                     args,
                     vocab_size=config["vocab_size"],
                     max_window_size=model_config.max_sequence_length,
+                    max_gen_len=model_config.max_sequence_length,
                 )
 
-        if args.convert_weight_only:
+        if args.convert_weights_only:
             exit(0)
 
         mod = mod_transform_before_build(mod, param_manager, args, model_config)
-        dump_shard_info(args, param_manager)
+        if args.num_shards > 1:
+            # We require a "create_sharding_info" function for all
+            # multi-GPU models, even if they are using pre-sharded
+            # weights.  When using pre-sharded weights, the list of
+            # initialization-time transforms to apply is empty.
+            sharding_module = create_shard_info_func(param_manager, args, model_config)
+            mod.update(sharding_module)
+
         with open(cache_path, "wb") as outfile:
             pickle.dump(mod, outfile)
         print(f"Save a cached module to {cache_path}.")
@@ -663,7 +931,7 @@ def build_model(args: BuildArgs) -> (Optional[str], Optional[str], Optional[str]
     Parameters
     ----------
     args : :class:`BuildArgs`
-        A dataclass of arguments for building models.
+        A dataclass of arguments for building models.mlc_llm/core.py
 
     Returns
     ----------

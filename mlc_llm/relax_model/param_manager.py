@@ -13,6 +13,7 @@ from tvm.relax.testing import nn
 
 from .. import quantization
 from .modules import named_parameters
+from ..transform import ReorderTransformFunc
 
 
 def f_default_compute_relax_param(relax_pname: str, torch_params: List[Any]) -> Any:
@@ -49,23 +50,29 @@ class Parameter:
 
     shard_dim : Optional[int]
         The dimension to be sharded.
+
+    shard_strategy : Optional[str]
+        The strategy to shard the parameter.
     """
 
     name: str
     param_info_dict: Dict[str, relax.TensorStructInfo]
     quant_spec: quantization.QuantizationSpec
     shard_dim: Optional[int]
+    shard_strategy: Optional[str]
 
     def __init__(
         self,
         name: str,
         quant_spec: quantization.QuantizationSpec,
         shard_dim: Optional[int],
+        shard_strategy: Optional[str],
     ) -> None:
         self.name = name
         self.param_info_dict = dict()
         self.quant_spec = quant_spec
         self.shard_dim = shard_dim
+        self.shard_strategy = shard_strategy
 
     def register_func(self, func_name: str, param_info: relax.TensorStructInfo):
         self.param_info_dict[func_name] = param_info
@@ -262,10 +269,36 @@ class ParamManager:
                 relax_param,
                 getattr(quantization_scheme, quant_kind.name),
                 func_name,
-                getattr(relax_param, "shard_dim", None),
+                relax_param.__dict__.get("shard_dim", None),
+                relax_param.__dict__.get("shard_strategy", None),
             )
 
             self.params_in_func[func_name].append(param)
+
+    def run_pre_quantize(self, model_path: str):
+        if self.f_run_prequantize is not None:
+            model_path = self.f_run_prequantize(model_path)
+
+        self.model_path = model_path
+        return model_path
+
+    def init_torch_pname_to_bin_name(self, use_safetensors: bool):
+        assert hasattr(self, "model_path"), (
+            "Must call either set_param_loading_func or run_pre_quantize "
+            "before init_torch_pname_to_bin_name"
+        )
+
+        if self.pidx2pname:
+            mapping = load_torch_pname2binname_map(
+                self.model_path,
+                use_safetensors,
+                set(self.pidx2pname.values()),
+                self.f_convert_pname_fwd,
+            )
+        else:
+            mapping = {}
+
+        self.torch_pname2binname = mapping
 
     def set_param_loading_func(
         self,
@@ -336,7 +369,7 @@ class ParamManager:
         else:
             self.pidx2pname = dict()
 
-    def transform_dequantize(self, mod: tvm.IRModule) -> tvm.IRModule:
+    def transform_dequantize(self) -> tvm.ir.transform.Pass:
         """Apply dequantization to the input IRModule.
 
         Parameters
@@ -353,38 +386,48 @@ class ParamManager:
             The IRModule updated with the dequantization computation.
         """
 
-        # For each Relax function in the input IRModule (e.g., "prefill"),
-        # we create its input relax.Var of all the quantized data, and
-        # store the mapping from function name to the var.
-        func2param_var: Dict[str, relax.Var] = {}
-        for gv, func in mod.functions.items():
-            if not isinstance(func, relax.Function):
-                continue
-            if func.attrs is None or not "num_input" in func.attrs:
-                continue
-            func2param_var[gv.name_hint] = relax.Var(
-                "params", self.get_quantized_param_info(gv.name_hint)
-            )
+        @tvm.ir.transform.module_pass(opt_level=0, name="ParamManager.transform_dequantize")
+        def transform_func(mod: tvm.IRModule, _context) -> tvm.IRModule:
+            # For each Relax function in the input IRModule (e.g., "prefill"),
+            # we create its input relax.Var of all the quantized data, and
+            # store the mapping from function name to the var.
+            func_name_to_quantized_params: Dict[str, List[relax.Var]] = {}
 
-        # Cache mapping to avoid duplicate dequantization.
-        dequantized_cache: Dict[relax.Var, relax.Var] = {}
+            for gv, func in mod.functions.items():
+                if isinstance(func, relax.Function) and func.attrs and "num_input" in func.attrs:
+                    quantized_param_info = self.get_quantized_param_info(gv.name_hint)
+                    param_vars = [
+                        relax.Var(f"param_{i}", info)
+                        for i, info in enumerate(quantized_param_info.fields)
+                    ]
+                    func_name_to_quantized_params[gv.name_hint] = param_vars
 
-        # Define a var replacement function for applying dequantization.
-        def f_replace(var: relax.Var, bb: relax.BlockBuilder, func_name: str) -> relax.Var:
-            if var in dequantized_cache:
-                return dequantized_cache[var]
-            assert var in self.func_raw_param_map
-            func_name, param = self.func_raw_param_map[var]
-            dequantized = self._dequantize(param, func2param_var[func_name], bb, func_name)
-            dequantized_cache[var] = dequantized
-            return dequantized
+            # Cache mapping to avoid duplicate dequantization.
+            dequantized_cache: Dict[relax.Var, relax.Var] = {}
 
-        # Create the function mutator for applying dequantization.
-        replacer = ParamReplacer(mod, func2param_var, f_replace)
-        # Update the input IRModule with dequantization.
-        mod = replacer.transform()
+            # Define a var replacement function for applying dequantization.
+            def f_replace(var: relax.Var, bb: relax.BlockBuilder) -> relax.Var:
+                if var in dequantized_cache:
+                    return dequantized_cache[var]
+                assert var in self.func_raw_param_map
 
-        return mod
+                func_name, param = self.func_raw_param_map[var]
+                quantized_params = func_name_to_quantized_params[func_name]
+                relevant_quantized_params = [quantized_params[i] for i in self.param2qrange[param]]
+
+                dequantized = self._dequantize(param, relevant_quantized_params, bb, func_name)
+
+                dequantized_cache[var] = dequantized
+                return dequantized
+
+            # Create the function mutator for applying dequantization.
+            replacer = ParamReplacer(mod, func_name_to_quantized_params, f_replace)
+            # Update the input IRModule with dequantization.
+            mod = replacer.transform()
+
+            return mod
+
+        return transform_func
 
     def get_quantized_param_info(self, func_name: str) -> List[relax.TensorStructInfo]:
         bb = relax.BlockBuilder()
@@ -589,6 +632,7 @@ class ParamManager:
         quant_spec: quantization.QuantizationSpec,
         func_name: str,
         shard_dim: Optional[int],
+        shard_strategy: Optional[str],
     ) -> Parameter:
         """Register a single parameter in the parameter manager.
         In most cases, this method is not directly used outside this class:
@@ -610,8 +654,11 @@ class ParamManager:
             The name of the function the input var is in.
             For example, the "prefill" function or the "decode" function.
 
-        shard_dim : int
+        shard_dim : Optional[int]
             The dimension along which the parameter is sharded.
+
+        shard_strategy : Optional[str]
+            The strategy of sharding the parameter.
 
         Returns
         -------
@@ -647,7 +694,7 @@ class ParamManager:
                     ), "Shape mismatch of one parameter in two functions."
         else:
             # Otherwise, the parameter is registered for the first time.
-            param = Parameter(name, quant_spec, shard_dim)
+            param = Parameter(name, quant_spec, shard_dim, shard_strategy)
             self.params[name] = param
             self.param_names.append(name)
 
@@ -660,10 +707,9 @@ class ParamManager:
     def _dequantize(
         self,
         param: Parameter,
-        quantized_tuple: relax.Var,
+        qparams: List[relax.Var],
         bb: relax.BlockBuilder,
         func_name: str,
-        qparams: List[relax.Var] = None,
     ) -> relax.Var:
         """Applying dequantization to the input parameter.
         This method is called by `transform_module` below, and is not
@@ -674,30 +720,13 @@ class ParamManager:
         param : Parameter
             The parameter whose quantized tensors are to be dequantized.
 
-        quantized_tuple : relax.Var
-            The relax.Var of the quantized tensors of all parameters in the model.
-
-        bb : relax.BlockBuilder
-            The Relax BlockBuilder used for inserting the dequantization computations.
-
-        func_name : str
-            The name of the  function which dequantization is applied to.
-
         qparams : List[relax.Var]
-            The quantized parts of the parameter.
-            By default it is `None`, in which case we will get the quantized parts
-            from `quantized_tuple`.
+            The relax.Var of the quantized tensors of all parameters in the model.
 
         Returns
         -------
         The dequantized parameter, in the form of a relax.Var.
         """
-        if not qparams:
-            # Get the corresponding Relax vars of the quantized tensors of this parameter.
-            qparams: List[relax.Var] = []
-            for qparam_idx in self.param2qrange[param]:
-                qparams.append(bb.emit(relax.TupleGetItem(quantized_tuple, qparam_idx)))
-
         # Get the dequantization function of this parameter.
         f_dequantize = param.quant_spec.get_dequantize_func(
             param_info=param.param_info_dict[func_name],
@@ -715,6 +744,42 @@ class ParamManager:
             # Apply the dequantization function.
             return bb.emit(f_dequantize(bb, qparams))
 
+    def create_parameter_transformation(self, optimize_parameter_order: bool = True):
+        """Produce an IRModule that can transform the parameters
+
+        Parameters
+        ----------
+        optimize_parameter_order: bool
+
+            If true, reorder the parameter transformations to
+            prioritize operations that use a currently-open file.  If
+            false, transform the parameters in their default order.
+
+        Returns
+        -------
+        tvm.IRModule
+            The transformation module
+
+        """
+        mod = _create_quantize_func(self)
+        if optimize_parameter_order:
+            mod = self.optimize_transform_param_order()(mod)
+        return mod
+
+    def optimize_transform_param_order(self) -> tvm.transform.Pass:
+        """Produce an transformation that optimizes for minimal memory footprint
+
+        Returns
+        -------
+        tvm.transform.Pass
+            The transformation
+        """
+        return ReorderTransformFunc(
+            self.pidx2pname,
+            self.torch_pname2binname,
+            self.f_convert_pname_fwd,
+        )
+
 
 @mutator
 class ParamReplacer(PyExprMutator):
@@ -725,7 +790,7 @@ class ParamReplacer(PyExprMutator):
     mod : tvm.IRModule
         The IRModule of the model to be updated.
 
-    func2param_var : Dict[str, relax.Var]
+    func_name_to_quantized_params : Dict[str, List[relax.Var]]
         The mapping from each function name to its input var of quantized data tuple.
 
     f_replace : Callable[[relax.Var, relax.BlockBuilder], relax.Var]
@@ -737,7 +802,7 @@ class ParamReplacer(PyExprMutator):
     """
 
     mod: tvm.IRModule
-    func2param_var: Dict[str, relax.Var]
+    func_name_to_quantized_params: Dict[str, List[relax.Var]]
     f_replace: Callable[[relax.Var, relax.BlockBuilder], relax.Var]
     param_set: Set[relax.Var]
 
@@ -746,12 +811,12 @@ class ParamReplacer(PyExprMutator):
     def __init__(
         self,
         mod: tvm.IRModule,
-        func2param_var: Dict[str, relax.Var],
+        func_name_to_quantized_params: Dict[str, relax.Var],
         f_replace: Callable[[relax.Var, relax.BlockBuilder], relax.Var],
     ):
         super().__init__(mod)
         self.mod = mod
-        self.func2param_var = func2param_var
+        self.func_name_to_quantized_params = func_name_to_quantized_params
         self.f_replace = f_replace
         self.cur_func_name = ""
 
@@ -763,31 +828,31 @@ class ParamReplacer(PyExprMutator):
                 continue
 
             assert (
-                gv.name_hint in self.func2param_var
-            ), f"{gv.name_hint} not in {self.func2param_var}"
-            self.cur_func_name = gv.name_hint
-            updated_func = self.rewrite_func(func, self.func2param_var[gv.name_hint])
+                gv.name_hint in self.func_name_to_quantized_params
+            ), f"{gv.name_hint} not in {self.func_name_to_quantized_params}"
+            updated_func = self.rewrite_func(func, self.func_name_to_quantized_params[gv.name_hint])
             updated_func = remove_all_unused(updated_func)
             self.builder_.update_func(gv, updated_func)
         return self.builder_.get()
 
-    def rewrite_func(self, func: Function, param_var: relax.Var) -> relax.Function:
+    def rewrite_func(self, func: Function, quantized_params: List[relax.Var]) -> relax.Function:
         num_input = int(func.attrs["num_input"])
         self.param_set = set(func.params[num_input:])
 
         body = self.visit_expr(func.body)
         return relax.Function(
-            params=func.params[:num_input] + [param_var],
+            params=func.params[:num_input] + quantized_params,
             body=body,
             ret_struct_info=func.ret_struct_info,
             is_pure=func.is_pure,
             attrs=func.attrs,
-        ).without_attr("num_input")
+        )
 
     def visit_var_(self, var: Var) -> Expr:
-        if var not in self.param_set:
+        if var in self.param_set:
+            return self.f_replace(var, self.builder_)
+        else:
             return super().visit_var_(var)
-        return self.f_replace(var, self.builder_, self.cur_func_name)
 
 
 ##################################################################
@@ -857,7 +922,7 @@ def load_torch_pname2binname_map(
     return torch_pname2binname
 
 
-def create_quantize_func(param_manager: ParamManager) -> tvm.IRModule:
+def _create_quantize_func(param_manager: ParamManager) -> tvm.IRModule:
     """Construct the Relax function which computes quantization.
     This method is called by `transform_module` below, and is not
     directly invoked outside the class.
@@ -950,3 +1015,132 @@ def create_quantize_func(param_manager: ParamManager) -> tvm.IRModule:
     param_manager.param2qrange = param2qrange
     # Return the created IRModule.
     return bb.get()
+
+
+def transform_params_for_each_rank(
+    mod: tvm.IRModule, num_shards: int, rank_argument_name: str = "rank_arg"
+) -> tvm.IRModule:
+    """Update a parameter transform to apply across all ranks
+
+    For use in generating a pre-sharded set of weights.  Given a
+    parameter transformation that generates sharded model weights for
+    a single shard, produce a parameter transformation that generates
+    sharded model weights for each shard.
+
+    Parameters
+    ----------
+    mod: tvm.IRModule
+
+        A module containing the parameter transformation function,
+        named "transform_params", along with any subroutines called by
+        the parameter transformation.
+
+    num_shards: int
+
+        The number of shards to generate.
+
+    rank_argument_name: str
+
+        The name of the argument that specifies the rank.  Should be a
+        R.ShapeTuple with a single R.PrimStructInfo('int64').
+
+    Returns
+    -------
+    tvm.IRModule
+
+        The modified parameter transformation
+    """
+    generic_transform = mod["transform_params"]
+    tensor_params = generic_transform.params[1:]
+
+    bb = relax.BlockBuilder()
+
+    with bb.function("transform_params", params=tensor_params):
+        output = []
+        for rank in range(num_shards):
+            # TODO(Lunderberg): Implement this in terms of a
+            # generic utility that inlines local functions.
+            func = generic_transform
+            func = func.bind_params({rank_argument_name: relax.ShapeExpr([rank])})
+            func = relax.utils.copy_with_new_vars(func)
+            func = func.bind_params(
+                {var: tensor_param for (var, tensor_param) in zip(func.params, tensor_params)}
+            )
+            shard_tuple = func.body
+            output.extend([shard_tuple[i] for i in range(len(tensor_params))])
+
+        with bb.dataflow():
+            gv = bb.emit_output(relax.Tuple(output))
+        bb.emit_func_output(gv)
+
+    mod["transform_params"] = bb.get()["transform_params"]
+    return mod
+
+
+def chain_parameter_transforms(mod_a: tvm.IRModule, mod_b: tvm.IRModule) -> tvm.IRModule:
+    """Chain two sequential parameter transformations
+
+    For use in manipulating sets of model weights.  Given two
+    parameter transformations that could be applied sequentially,
+    produce a single parameter transformation whose output is the same
+    as applying the parameter transformations sequentially.
+
+
+    .. code-block:: python
+
+        # Before
+        params_after_a = mod_a['transform_params'](orig_params)
+        params_after_b = mod_b['transform_params'](params_after_a)
+
+        # After
+        mod_ab = chain_parameter_transforms(mod_a, mod_b)
+        params_after_b = mod_ab['transform_params'](orig_params)
+
+    Parameters
+    ----------
+    mod_a: tvm.IRModule
+
+        The module containing the first parameter transformation.
+
+    mod_b: tvm.IRModule
+
+        The module containing the second parameter transformation.
+
+    Returns
+    -------
+    tvm.IRModule
+
+        The module containing the output
+
+    """
+    func_a = mod_a["transform_params"]
+    func_b = mod_b["transform_params"]
+
+    bb = relax.BlockBuilder()
+
+    with bb.function("transform_params", params=func_a.params):
+        with bb.dataflow():
+            # TODO(Lunderberg): Implement this in terms of a
+            # generic utility that inlines local functions.
+            func_a_output = bb.emit(func_a.body)
+            func_b_param_map = {param: expr for (param, expr) in zip(func_b.params, func_a_output)}
+            func_b_output = func_b.bind_params(func_b_param_map).body
+            gv = bb.emit_output(func_b_output)
+        bb.emit_func_output(gv)
+
+    merged_transform_func = bb.get()["transform_params"]
+
+    new_mod = {
+        **{
+            gvar: func
+            for gvar, func in mod_a.functions.items()
+            if gvar.name_hint != "transform_params"
+        },
+        **{
+            gvar: func
+            for gvar, func in mod_b.functions.items()
+            if gvar.name_hint != "transform_params"
+        },
+        "transform_params": merged_transform_func,
+    }
+    return tvm.IRModule(new_mod)

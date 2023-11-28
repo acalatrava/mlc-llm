@@ -2,20 +2,20 @@
 
 # MLC LLM
 
-[Documentation](https://llm.mlc.ai/docs) | [Blog](https://blog.mlc.ai/) | [WebLLM](https://webllm.mlc.ai/) | [WebStableDiffusion](https://websd.mlc.ai/) | [Discord][discord-url]
+[Documentation](https://llm.mlc.ai/docs) | [Blog](https://blog.mlc.ai/) | [Discord][discord-url]
 
-Machine Learning Compilation for Large Language Models (MLC LLM) is a high-performance **universal deployment** solution that allows native deployment of any large language models with native APIs with compiler acceleration. The mission of this project is to enable everyone to develop, optimize and deploy AI models natively on everyone's devices with ML compilation techniques.
+**M**achine **L**earning **C**ompilation for **L**arge **L**anguage **M**odels (MLC LLM) is a high-performance universal deployment solution that allows native deployment of any large language models with native APIs with compiler acceleration. The mission of this project is to enable everyone to develop, optimize and deploy AI models natively on everyone's devices with ML compilation techniques.
 
-MLC LLM supports the following platforms and hardware:
+**Universal deployment.** MLC LLM supports the following platforms and hardware:
 
 <table style="width:100%">
   <thead>
     <tr>
-      <th style="width:16%"> </th>
-      <th style="width:21%">AMD GPU</th>
-      <th style="width:21%">NVIDIA GPU</th>
-      <th style="width:21%">Apple M1/M2 GPU</th>
-      <th style="width:21%">Intel GPU</th>
+      <th style="width:15%"> </th>
+      <th style="width:20%">AMD GPU</th>
+      <th style="width:20%">NVIDIA GPU</th>
+      <th style="width:20%">Apple GPU</th>
+      <th style="width:24%">Intel GPU</th>
     </tr>
   </thead>
   <tbody>
@@ -28,21 +28,18 @@ MLC LLM supports the following platforms and hardware:
     </tr>
     <tr>
       <td>macOS</td>
-      <td>✅ Metal</td>
+      <td>✅ Metal (dGPU)</td>
       <td>N/A</td>
       <td>✅ Metal</td>
-      <td>✅ Metal</td>
+      <td>✅ Metal (iGPU)</td>
     </tr>
     <tr>
       <td>Web Browser</td>
-      <td>✅ WebGPU</td>
-      <td>✅ WebGPU</td>
-      <td>✅ WebGPU</td>
-      <td>✅ WebGPU</td>
+      <td colspan=4>✅ WebGPU and WASM </td>
     </tr>
     <tr>
       <td>iOS / iPadOS</td>
-      <td colspan=4>✅ Metal on Apple M1/M2 GPU</td>
+      <td colspan=4>✅ Metal on Apple A-series GPU</td>
     </tr>
     <tr>
       <td>Android</td>
@@ -52,14 +49,86 @@ MLC LLM supports the following platforms and hardware:
   </tbody>
 </table>
 
+
+**Scalable.** MLC LLM scales universally on NVIDIA and AMD GPUs, cloud and gaming GPUs. Below
+showcases our single batch decoding performance with prefilling = 1 and decoding = 256.
+
+Performance of 4-bit CodeLlama-34B and Llama2-70B on two NVIDIA RTX 4090 and two AMD Radeon 7900 XTX:
+<p float="left">
+  <img src="site/img/multi-gpu/figure-1.svg" width="40%"/>
+  <img src="site/img/multi-gpu/figure-3.svg" width="30%"/>
+</p>
+
+Scaling of fp16 and 4-bit CodeLlama-34 and Llama2-70B on A100-80G-PCIe and A10G-24G-PCIe, up to 8 GPUs:
+<p float="center">
+  <img src="site/img/multi-gpu/figure-2.svg" width="100%"/>
+</p>
+
 ## News
 
-* [08/02/2023] [Dockerfile](https://github.com/junrushao/llm-perf-bench/) released for CUDA performance benchmarking
-* [07/19/2023] Supports 7B/13B/70B Llama-2
+* [10/18/2023] [[Post]](https://blog.mlc.ai/2023/10/19/Scalable-Language-Model-Inference-on-Multiple-NVDIA-AMD-GPUs) Scalable multi-GPU support for CUDA and ROCm are official.
+* [09/02/2023] Prebuilt ROCm 5.7 and CUDA 12.2 package is [available](https://llm.mlc.ai/docs/install/tvm.html#option-1-prebuilt-package).
+* [08/25/2023] CodeLlama support is up.
+* [08/14/2023] [[Post]](https://blog.mlc.ai/2023/08/09/GPU-Accelerated-LLM-on-Orange-Pi) Mali GPU support is up on Orange Pi.
+* [08/09/2023] [[Post]](https://blog.mlc.ai/2023/08/09/Making-AMD-GPUs-competitive-for-LLM-inference) ROCm backend is mature to use.
+* [08/02/2023] [Dockerfile](https://github.com/mlc-ai/llm-perf-bench/) is released for CUDA performance benchmarking.
+* [07/19/2023] Support for Llama2-7B/13B/70B is up.
+* [05/22/2023] [[Post]](https://blog.mlc.ai/2023/05/22/bringing-open-large-language-models-to-consumer-devices) RedPajama support is up.
+* [05/08/2023] [[Post]](https://blog.mlc.ai/2023/05/08/bringing-hardware-accelerated-language-models-to-android-devices) MLC LLM is now available on Android.
+* [05/01/2023] [[Post]](https://blog.mlc.ai/2023/05/01/bringing-accelerated-llm-to-consumer-hardware) MLC LLM is released with Metal, Vulkan and CUDA backends.
+* [04/14/2023] [WebLLM](https://github.com/mlc-ai/web-llm) is released prior to MLC LLM with WebGPU and WebAssembly backend.
 
 ## Getting Started
 
-<ins>**[Check out our instruction page to try out!](https://llm.mlc.ai/docs/get_started/try_out.html)**</ins>
+Please visit our [documentation](https://llm.mlc.ai/docs/index.html#getting-started) for detailed instructions.
+
+## Model Support
+
+MLC LLM supports a wide range of model architectures and variants. We have the following prebuilts which you can
+use off-the-shelf. Visit [Prebuilt Models](https://llm.mlc.ai/docs/prebuilt_models.html) to see the full list, and [Compile Models via MLC](https://llm.mlc.ai/docs/compilation/compile_models.html) to see how to use models not on this list.
+
+<table style="width:100%">
+  <thead>
+    <tr>
+      <th style="width:40%">Architecture</th>
+      <th style="width:60%">Prebuilt Model Variants</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Llama</td>
+      <td>Llama-2, Code Llama, Vicuna, WizardLM, WizardMath, OpenOrca Platypus2, FlagAlpha Llama-2 Chinese, georgesung Llama-2 Uncensored</td>
+    </tr>
+    <tr>
+      <td>GPT-NeoX</td>
+      <td>RedPajama</td>
+    </tr>
+    <tr>
+      <td>GPT-J</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>RWKV</td>
+      <td>RWKV-raven</td>
+    </tr>
+    <tr>
+      <td>MiniGPT</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>GPTBigCode</td>
+      <td>WizardCoder</td>
+    </tr>
+    <tr>
+      <td>ChatGLM</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>StableLM</td>
+      <td></td>
+    </tr>
+  </tbody>
+</table>
 
 ## Universal Deployment APIs
 
@@ -138,9 +207,6 @@ The underlying techniques of MLC LLM include:
 
 - You might want to check out our online public [Machine Learning Compilation course](https://mlc.ai) for a systematic
 walkthrough of our approaches.
+- [WebLLM](https://webllm.mlc.ai/) is a companion project using MLC LLM's WebGPU and WebAssembly backend.
+- [WebStableDiffusion](https://websd.mlc.ai/) is a companion project for diffusion models with the WebGPU backend.
 
-## Acknowledgements
-
-This project is initiated by members from CMU catalyst, UW SAMPL, SJTU, OctoML and the MLC community. We would love to continue developing and supporting the open-source ML community.
-
-This project is only possible thanks to the shoulders open-source ecosystems that we stand on. We want to thank the Apache TVM community and developers of the TVM Unity effort. The open-source ML community members made these models publicly available. PyTorch and Hugging Face communities that make these models accessible. We would like to thank the teams behind Vicuna, SentencePiece, LLaMA, Alpaca, MOSS and RWKV. We also would like to thank the Vulkan, Swift, C++, Python Rust communities that enables this project.

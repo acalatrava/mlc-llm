@@ -70,6 +70,10 @@ Conversation Llama2() {
 Conversation MistralDefault() {
   Conversation conv;
   conv.name = "mistral_default";
+  conv.system =
+      ("[INST] Always assist with care, respect, and truth. Respond with utmost utility yet "
+       "securely. Avoid harmful, unethical, prejudiced, or negative content. Ensure replies "
+       "promote fairness and positivity.");
   conv.roles = {"[INST]", "[/INST]"};
   conv.messages = {};
   conv.offset = 0;
@@ -113,6 +117,25 @@ Conversation CodeLlamaInstruct() {
   conv.role_empty_sep = " ";
   conv.stop_tokens = {2};
   conv.stop_str = "</s>";
+  conv.add_bos = true;
+  return conv;
+}
+
+Conversation GPT2() {
+  Conversation conv;
+  conv.name = "gpt2";
+  conv.system = "";
+  conv.roles = {"USER", "ASSISTANT"};
+  conv.messages = {};
+  conv.offset = 0;
+  conv.separator_style = SeparatorStyle::kSepRoleMsg;
+  conv.seps = {"<|endoftext|>", "<|endoftext|>"};
+  conv.role_msg_sep = ": ";
+  conv.role_empty_sep = ":";
+  // TODO(mlc-team): add eos to mlc-chat-config
+  // and remove eos from stop token setting.
+  conv.stop_tokens = {50256};
+  conv.stop_str = "|endoftext|";
   conv.add_bos = true;
   return conv;
 }
@@ -494,6 +517,25 @@ Conversation VanillaLM() {
   return conv;
 }
 
+Conversation StableLM3B() {
+  Conversation conv;
+  conv.name = "stablelm-3b";
+  conv.system = "";
+  conv.roles = {"Prompt", "LM"};
+  conv.messages = {};
+  conv.separator_style = SeparatorStyle::kLM;
+  conv.offset = 0;
+  conv.seps = {""};
+  conv.role_msg_sep = "";
+  conv.role_empty_sep = "";
+  // TODO(mlc-team): add eos to mlc-chat-config
+  // and remove eos from stop token setting.
+  // so the same template works for more tokenizers
+  conv.stop_tokens = {0};
+  conv.add_bos = true;
+  return conv;
+}
+
 Conversation GPTBigCode() {
   Conversation conv;
   conv.name = "gpt_bigcode";
@@ -587,6 +629,7 @@ Conversation Conversation::FromTemplate(const std::string& name) {
       {"mistral_default", MistralDefault},
       {"codellama_completion", CodeLlamaCompletion},
       {"codellama_instruct", CodeLlamaInstruct},
+      {"gpt2", GPT2},
       {"vicuna_v1.1", VicunaV11},
       {"conv_one_shot", ConvOneShot},
       {"redpajama_chat", RedPajamaChat},
@@ -602,6 +645,7 @@ Conversation Conversation::FromTemplate(const std::string& name) {
       {"minigpt", MiniGPT},
       {"moss", MOSS},
       {"LM", VanillaLM},
+      {"stablelm-3b", StableLM3B},
       {"gpt_bigcode", GPTBigCode},
       {"wizardlm_7b", WizardLM7B},
       {"wizard_coder_or_math", WizardCoderOrMATH},

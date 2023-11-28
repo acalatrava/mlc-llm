@@ -163,7 +163,8 @@ struct ModelPaths {
    */
   std::filesystem::path lib;
 
-  static ModelPaths Find(const std::string& device_name, const std::string& local_id);
+  static ModelPaths Find(const std::string& device_name, const std::string& local_id,
+                         const std::string& user_lib_path);
 };
 
 /*!
@@ -212,6 +213,7 @@ class ChatModule {
     this->get_role0_ = this->chat_mod_->GetFunction("get_role0");
     this->get_role1_ = this->chat_mod_->GetFunction("get_role1");
     this->runtime_stats_text_ = this->chat_mod_->GetFunction("runtime_stats_text");
+    this->verbose_runtime_stats_text_ = this->chat_mod_->GetFunction("verbose_runtime_stats_text");
     this->reset_chat_ = this->chat_mod_->GetFunction("reset_chat");
     this->process_system_prompts_ = this->chat_mod_->GetFunction("process_system_prompts");
     this->lib_path_ = "";
@@ -224,6 +226,7 @@ class ChatModule {
     ICHECK(get_role0_ != nullptr);
     ICHECK(get_role1_ != nullptr);
     ICHECK(runtime_stats_text_ != nullptr);
+    ICHECK(verbose_runtime_stats_text_ != nullptr);
     ICHECK(reset_chat_ != nullptr);
   }
   /*!
@@ -263,6 +266,9 @@ class ChatModule {
   /*! \return A text describing the runtime statistics. */
   std::string RuntimeStatsText() { return runtime_stats_text_(); }
 
+  /*! \return A text describing the token statistics. */
+  std::string VerboseRuntimeStatsText() { return verbose_runtime_stats_text_(); }
+
   /*!
    * \brief Run prefill stage for a given input and decode the first output token.
    * \param input the user input.
@@ -295,6 +301,7 @@ class ChatModule {
   tvm::runtime::PackedFunc get_role0_;
   tvm::runtime::PackedFunc get_role1_;
   tvm::runtime::PackedFunc runtime_stats_text_;
+  tvm::runtime::PackedFunc verbose_runtime_stats_text_;
   tvm::runtime::PackedFunc reset_chat_;
   tvm::runtime::PackedFunc process_system_prompts_;
 
@@ -331,7 +338,8 @@ std::string ReadStringFromJSONFile(const std::filesystem::path& config_path,
   return config[key].get<std::string>();
 }
 
-ModelPaths ModelPaths::Find(const std::string& device_name, const std::string& local_id) {
+ModelPaths ModelPaths::Find(const std::string& device_name, const std::string& local_id,
+                            const std::string& user_lib_path) {
   // Step 1. Find config path
   std::filesystem::path config_path;
   if (auto path = TryInferMLCChatConfig(local_id)) {
@@ -362,26 +370,36 @@ ModelPaths ModelPaths::Find(const std::string& device_name, const std::string& l
   }
   std::cout << "Use model weights: " << params_json << std::endl;
   // Step 3. Find model lib path
-  std::string lib_local_id = ReadStringFromJSONFile(config_path, "model_lib");
-  std::string lib_name = lib_local_id + "-" + device_name;
   std::filesystem::path lib_path;
-  if (auto path = FindFile({lib_local_id,
-                            "dist/prebuilt/lib",  // Using prebuilt workflow
-                            "dist/" + local_id, "dist/prebuilt/" + lib_local_id},
-                           {
-                               lib_name + GetArchSuffix(),
-                               lib_name,
-                           },
-                           GetLibSuffixes())) {
-    lib_path = path.value();
+  if (!user_lib_path.empty()) {
+    lib_path = user_lib_path;
+    if (!std::filesystem::exists(lib_path) || !std::filesystem::is_regular_file(lib_path)) {
+      LOG(FATAL) << "The `lib_path` you passed in is not a file: " << user_lib_path << "\n";
+      exit(1);
+    }
   } else {
-    LOG(FATAL) << "Cannot find the model library that corresponds to `" << lib_local_id << "`.\n"
-               << "We searched over the following possible paths: \n"
-               << "- " + lib_local_id << "\n"
-               << "- dist/prebuilt/lib \n"
-               << "- dist/" + local_id << "\n"
-               << "- dist/prebuilt/" + lib_local_id;
-    exit(1);
+    std::string lib_local_id = ReadStringFromJSONFile(config_path, "model_lib");
+    std::string lib_name = lib_local_id + "-" + device_name;
+    if (auto path = FindFile({lib_local_id,
+                              "dist/prebuilt/lib",  // Using prebuilt workflow
+                              "dist/" + local_id, "dist/prebuilt/" + lib_local_id},
+                             {
+                                 lib_name + GetArchSuffix(),
+                                 lib_name,
+                             },
+                             GetLibSuffixes())) {
+      lib_path = path.value();
+    } else {
+      LOG(FATAL) << "Cannot find the model library that corresponds to `" << lib_local_id << "`.\n"
+                 << "We searched over the following possible paths: \n"
+                 << "- " + lib_local_id << "\n"
+                 << "- dist/prebuilt/lib \n"
+                 << "- dist/" + local_id << "\n"
+                 << "- dist/prebuilt/" + lib_local_id << "\n"
+                 << "If you would like to directly specify the full model library path, you may "
+                 << "consider passing in the `--model-lib-path` argument.\n";
+      exit(1);
+    }
   }
   std::cout << "Use model library: " << lib_path << std::endl;
   return ModelPaths{config_path, params_json, lib_path};
@@ -421,8 +439,8 @@ void Converse(ChatModule* chat, const std::string& input, int stream_interval,
  * \param stream_interval The interval that should be used for streaming the response.
  */
 void Chat(ChatModule* chat, const std::string& device_name, std::string local_id,
-          int stream_interval = 2) {
-  ModelPaths model = ModelPaths::Find(device_name, local_id);
+          std::string lib_path, int stream_interval = 2) {
+  ModelPaths model = ModelPaths::Find(device_name, local_id, lib_path);
   PrintSpecialCommands();
   chat->Reload(model);
   chat->ProcessSystemPrompts();
@@ -450,7 +468,7 @@ void Chat(ChatModule* chat, const std::string& device_name, std::string local_id
       if (new_local_id.empty()) {
         new_local_id = local_id;
       }
-      model = ModelPaths::Find(device_name, new_local_id);
+      model = ModelPaths::Find(device_name, new_local_id, lib_path);
       chat->Reload(model);
       local_id = new_local_id;
     } else if (input.substr(0, 5) == "/help") {
@@ -462,9 +480,19 @@ void Chat(ChatModule* chat, const std::string& device_name, std::string local_id
 }
 
 int main(int argc, char* argv[]) {
-  argparse::ArgumentParser args("mlc_chat");
+  argparse::ArgumentParser args("mlc_chat_cli");
 
-  args.add_argument("--model");
+  args.add_description(
+      "MLCChat CLI is the command line tool to run MLC-compiled LLMs out of the box.\n"
+      "Note: the --model argument is required. It can either be the model name with its "
+      "quantization scheme or a full path to the model folder. In the former case, the "
+      "provided name will be used to search for the model folder over possible paths. "
+      "--model-lib-path argument is optional. If unspecified, the --model argument will be used "
+      "to search for the library file over possible paths.");
+
+  args.add_argument("--model").help("[required] the model to use");
+  args.add_argument("--model-lib-path")
+      .help("[optional] the full path to the model library file to use");
   args.add_argument("--device").default_value("auto");
   args.add_argument("--evaluate").default_value(false).implicit_value(true);
   args.add_argument("--eval-prompt-len").default_value(128).scan<'i', int>();
@@ -479,6 +507,10 @@ int main(int argc, char* argv[]) {
   }
 
   std::string local_id = args.get<std::string>("--model");
+  std::string lib_path;
+  if (args.present("--model-lib-path")) {
+    lib_path = args.get<std::string>("--model-lib-path");
+  }
   auto [device_name, device_id] = DetectDevice(args.get<std::string>("--device"));
 
   try {
@@ -488,14 +520,14 @@ int main(int argc, char* argv[]) {
       // that are not supposed to be used in chat app setting
       int prompt_len = args.get<int>("--eval-prompt-len");
       int gen_len = args.get<int>("--eval-gen-len");
-      ModelPaths model = ModelPaths::Find(device_name, local_id);
+      ModelPaths model = ModelPaths::Find(device_name, local_id, lib_path);
       tvm::runtime::Module chat_mod = mlc::llm::CreateChatModule(GetDevice(device_name, device_id));
       std::string model_path = model.config.parent_path().string();
       tvm::runtime::Module lib = tvm::runtime::Module::LoadFromFile(model.lib.string());
       chat_mod.GetFunction("reload")(lib, tvm::String(model_path));
       chat_mod.GetFunction("evaluate")(prompt_len, gen_len);
     } else {
-      Chat(&chat, device_name, local_id);
+      Chat(&chat, device_name, local_id, lib_path);
     }
   } catch (const std::runtime_error& err) {
     std::cerr << err.what() << std::endl;

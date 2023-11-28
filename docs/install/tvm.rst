@@ -37,97 +37,93 @@ A nightly prebuilt Python package of Apache TVM Unity is provided.
             .. code-block:: bash
 
               conda activate your-environment
-              python3 -m pip install --pre --force-reinstall -f https://mlc.ai/wheels mlc-ai-nightly
-
-         .. tab:: CUDA 11.6
-
-            .. code-block:: bash
-
-              conda activate your-environment
-              python3 -m pip install --pre --force-reinstall -f https://mlc.ai/wheels mlc-ai-nightly-cu116
+              python3 -m pip install --pre -U -f https://mlc.ai/wheels mlc-ai-nightly
 
          .. tab:: CUDA 11.7
 
             .. code-block:: bash
 
               conda activate your-environment
-              python3 -m pip install --pre --force-reinstall -f https://mlc.ai/wheels mlc-ai-nightly-cu117
+              python3 -m pip install --pre -U -f https://mlc.ai/wheels mlc-ai-nightly-cu117
 
          .. tab:: CUDA 11.8
 
             .. code-block:: bash
 
               conda activate your-environment
-              python3 -m pip install --pre --force-reinstall -f https://mlc.ai/wheels mlc-ai-nightly-cu118
+              python3 -m pip install --pre -U -f https://mlc.ai/wheels mlc-ai-nightly-cu118
 
          .. tab:: CUDA 12.1
 
             .. code-block:: bash
 
               conda activate your-environment
-              python3 -m pip install --pre --force-reinstall -f https://mlc.ai/wheels mlc-ai-nightly-cu121
+              python3 -m pip install --pre -U -f https://mlc.ai/wheels mlc-ai-nightly-cu121
+
+         .. tab:: CUDA 12.2
+
+            .. code-block:: bash
+
+              conda activate your-environment
+              python3 -m pip install --pre -U -f https://mlc.ai/wheels mlc-ai-nightly-cu122
 
          .. tab:: ROCm 5.6
 
             .. code-block:: bash
 
               conda activate your-environment
-              python3 -m pip install --pre --force-reinstall -f https://mlc.ai/wheels mlc-ai-nightly-rocm
+              python3 -m pip install --pre -U -f https://mlc.ai/wheels mlc-ai-nightly-rocm56
+
+         .. tab:: ROCm 5.7
+
+            .. code-block:: bash
+
+              conda activate your-environment
+              python3 -m pip install --pre -U -f https://mlc.ai/wheels mlc-ai-nightly-rocm57
 
          .. tab:: Vulkan
 
             Supported in all Linux packages.
 
+      .. note::
+
+        If encountering issues with GLIBC not found, please install the latest glibc in conda:
+
+        .. code-block:: bash
+
+          conda install -c conda-forge libgcc-ng
+
    .. tab:: macOS
 
       .. tabs::
 
-         .. tab:: CPU
+         .. tab:: CPU + Metal
 
             .. code-block:: bash
 
               conda activate your-environment
-              python3 -m pip install --pre --force-reinstall -f https://mlc.ai/wheels mlc-ai-nightly
+              python3 -m pip install --pre -U -f https://mlc.ai/wheels mlc-ai-nightly
 
-            Always check if conda is installed properly in macOS using the command below:
+        .. note::
 
-            - Mac with Intel chip: "osx-64"
-            - Mac with Apple chip: "osx-arm64"
+          Always check if conda is installed properly in macOS using the command below:
 
-            .. code-block:: bash
+          .. code-block:: bash
 
-              conda info | grep platform
+            conda info | grep platform
 
-         .. tab:: Metal
-
-            .. code-block:: bash
-
-              conda activate your-environment
-              python3 -m pip install --pre --force-reinstall -f https://mlc.ai/wheels mlc-ai-nightly
-
-            Always check if conda is installed properly in macOS using the command below:
-
-            - Mac with Intel chip: "osx-64"
-            - Mac with Apple chip: "osx-arm64"
-
-            .. code-block:: bash
-
-              conda info | grep platform
+          It should return "osx-64" for Mac with Intel chip, and "osx-arm64" for Mac with Apple chip.
 
    .. tab:: Windows
 
       .. tabs::
 
-         .. tab:: CPU
+         .. tab:: CPU + Vulkan
 
             .. code-block:: bash
 
               conda activate your-environment
-              python3 -m pip install --pre --force-reinstall -f https://mlc.ai/wheels mlc-ai-nightly
-
-         .. tab:: Vulkan
-
-            Supported in all Windows packages.
+              python3 -m pip install --pre -U -f https://mlc.ai/wheels mlc-ai-nightly
 
       .. note::
         If encountering the error below:
@@ -136,8 +132,11 @@ A nightly prebuilt Python package of Apache TVM Unity is provided.
 
             FileNotFoundError: Could not find module 'path\to\site-packages\tvm\tvm.dll' (or one of its dependencies). Try using the full path with constructor syntax.
 
-        It is likely `zstd`, a dependency to LLVM, was missing. Please `download <https://github.com/facebook/zstd/releases/tag/v1.5.5>`__ the precompiled binary, rename it to `zstd.dll` and copy to the same folder as `tvm.dll`.
+        It is likely `zstd`, a dependency to LLVM, was missing. Please use the command below to get it installed:
 
+        .. code-block:: bash
+
+            conda install zstd
 
 .. _tvm-unity-build-from-source:
 
